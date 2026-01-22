@@ -1,0 +1,26 @@
+# Ignorar todo por defecto
+*
+
+# Permitir estructura de carpetas necesaria
+!2_Areas/
+!2_Areas/Python/
+!2_Areas/Python/transcribir_audio.py
+!requirements.txt
+!.env.example
+!README.md
+!.gitignore
+
+# Ignorar archivos temporales y basura de sistema
+**/.DS_Store
+**/__pycache__/
+*.log
+*.tmp
+.env
+
+# Ignorar audios y resultados (por si acaso se me escapa algo en las carpetas permitidas)
+*.mp3
+*.wav
+*.m4a
+*.txt
+2_Areas/Python/input/
+2_Areas/Python/output/
