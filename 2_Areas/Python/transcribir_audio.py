@@ -46,6 +46,24 @@ def check_ffmpeg():
         print("Error: ffmpeg no está instalado o no se encuentra en el PATH.")
         sys.exit(1)
 
+def get_audio_duration(audio_path: Path) -> float:
+    """
+    Obtiene la duración del audio en segundos usando ffprobe.
+    """
+    cmd = [
+        "ffprobe", 
+        "-v", "error", 
+        "-show_entries", "format=duration", 
+        "-of", "default=noprint_wrappers=1:nokey=1", 
+        str(audio_path)
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return float(result.stdout.strip())
+    except Exception as e:
+        logger.error(f"Error obteniendo duración de {audio_path.name}: {e}")
+        return 0.0
+
 def optimize_audio(input_path: Path) -> Path:
     """
     Optimiza el audio usando ffmpeg directamente via subprocess.
@@ -84,11 +102,11 @@ def optimize_audio(input_path: Path) -> Path:
         logger.error(f"Error crítico en optimize_audio: {e}")
         raise
 
-def split_audio_smart(audio_path: Path) -> List[Path]:
+def split_audio_smart(audio_path: Path, segment_time: int = CHUNK_TIME_SECONDS) -> List[Path]:
     """
-    Divide el audio en chunks de ~10 minutos usando ffmpeg segment.
+    Divide el audio en chunks usando ffmpeg segment.
     """
-    logger.info(f"Procesando chunks para: {audio_path}")
+    logger.info(f"Procesando chunks ({segment_time}s) para: {audio_path}")
     
     output_pattern = audio_path.parent / f"chunk_%03d_{audio_path.name}"
     
@@ -97,7 +115,7 @@ def split_audio_smart(audio_path: Path) -> List[Path]:
         "-y",
         "-i", str(audio_path),
         "-f", "segment",
-        "-segment_time", str(CHUNK_TIME_SECONDS),
+        "-segment_time", str(segment_time),
         "-c", "copy", # Copiar stream para ser rápido sin recodificar
         str(output_pattern)
     ]
@@ -266,39 +284,55 @@ def process_file(client, input_file: Path, output_dir: Path, model: str, move_to
             os.remove(temp_optimized)
             tqdm.write(f" Hecho (Original: {orig_size/1024/1024:.2f}MB vs Optimizado: {opt_size/1024/1024:.2f}MB -> Ahorro <10%, mantenemos Original)")
         
-        # 2. Chunking
-        # Usamos el archivo que ya está en output_dir
-        # tqdm.write("  -> Generando chunks...", end="")
+        # 2. Obtener duración y decidir troceado
+        duration = get_audio_duration(final_audio_path)
+        logger.info(f"Duración detectada: {duration:.2f}s")
+        
         chunks = []
-        if not model.startswith("gemini"):
-            chunks = split_audio_smart(final_audio_path)
-            # Los chunks se generarán en output_dir
-            if chunks: 
-                 new_chunks = [c for c in chunks if c != final_audio_path]
-                 temp_files.extend(new_chunks)
+        is_gemini = model.startswith("gemini")
+        
+        if is_gemini:
+            # Si Gemini y > 1h, troceamos en bloques de 40 min para asegurar estabilidad
+            if duration > 3600:
+                tqdm.write(f"  -> Audio largo detectado ({duration/3600:.1f}h). Dividiendo para Gemini...")
+                sys.stdout.flush()
+                chunks = split_audio_smart(final_audio_path, segment_time=2400) # 40 min
+            else:
+                # Audio corto, Gemini lo procesa de una pieza
+                chunks = [final_audio_path]
+        else:
+            # OpenAI siempre usa chunks de 10 min
+            chunks = split_audio_smart(final_audio_path, segment_time=CHUNK_TIME_SECONDS)
+            
+        if chunks:
+            new_chunks = [c for c in chunks if c != final_audio_path]
+            temp_files.extend(new_chunks)
         
         # 3. Transcribir
         full_transcript = []
         
-        if model.startswith("gemini"):
-            # En Gemini procesamos el audio completo de una vez
-            tqdm.write(f"  -> Transcribiendo con {model}...")
-            sys.stdout.flush()
-            text = transcribe_with_gemini(final_audio_path, model, prompt_text=languages_prompt)
-            full_transcript.append(text)
-        else:
-            # En OpenAI seguimos con chunks
-            if not chunks:
-                chunks = [final_audio_path]
-            
-            # Barra de progreso para chunks
-            for chunk in tqdm(chunks, desc=f"  Transcribiendo {clean_stem[:15]}...", unit="chunk", leave=False):
-                # Pasamos el prompt de idiomas si existe
+        for i, chunk in enumerate(chunks):
+            if is_gemini:
+                if len(chunks) > 1:
+                    tqdm.write(f"  -> Transcribiendo bloque {i+1}/{len(chunks)} con {model}...")
+                    sys.stdout.flush()
+                else:
+                    tqdm.write(f"  -> Transcribiendo con {model}...")
+                    sys.stdout.flush()
+                    
+                text = transcribe_with_gemini(chunk, model, prompt_text=languages_prompt)
+                full_transcript.append(text)
+            else:
+                # OpenAI
+                tqdm.write(f"  -> Transcribiendo {chunk.name}...")
+                sys.stdout.flush()
                 text = transcribe_chunk(client, chunk, model, prompt_text=languages_prompt)
                 full_transcript.append(text)
         
         # 4. Guardar (Usando NOMBRE LIMPIO)
-        final_text = "\n".join(full_transcript)
+        # Separador para Gemini si hay varios trozos
+        separator = "\n\n[Continuación...]\n\n" if (is_gemini and len(chunks) > 1) else "\n"
+        final_text = separator.join(full_transcript)
         output_file = output_dir / f"{clean_stem}.txt"
         
         with open(output_file, "w", encoding="utf-8") as f:
