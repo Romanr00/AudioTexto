@@ -5,6 +5,7 @@ import logging
 import subprocess
 import shutil
 import re
+import time
 from typing import List
 from pathlib import Path
 from dotenv import load_dotenv
@@ -164,7 +165,10 @@ def transcribe_with_gemini(audio_path: Path, model_name: str, prompt_text: str =
         if prompt_text:
             prompt = f"{prompt} Contexto adicional: {prompt_text}"
             
-        response = model.generate_content([prompt, audio_file])
+        response = model.generate_content(
+            [prompt, audio_file],
+            request_options={"timeout": 7200}
+        )
         return response.text
     except Exception as e:
         logger.error(f"Error en Gemini ({audio_path.name}): {e}")
@@ -279,6 +283,7 @@ def process_file(client, input_file: Path, output_dir: Path, model: str, move_to
         if model.startswith("gemini"):
             # En Gemini procesamos el audio completo de una vez
             tqdm.write(f"  -> Transcribiendo con {model}...")
+            sys.stdout.flush()
             text = transcribe_with_gemini(final_audio_path, model, prompt_text=languages_prompt)
             full_transcript.append(text)
         else:
