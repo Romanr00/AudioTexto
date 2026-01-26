@@ -34,6 +34,14 @@ TARGET_CHANNELS = "1"  # Mono
 TARGET_SAMPLE_RATE = "16000"
 CHUNK_TIME_SECONDS = 600  # 10 minutos
 
+# Ajustes de Seguridad para evitar bloqueos innecesarios en transcripciones
+SAFETY_SETTINGS = [
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+]
+
 def get_openai_client():
     api_key = os.environ.get('OPENAI_API_KEY')
     if not api_key:
@@ -185,7 +193,8 @@ def transcribe_with_gemini(audio_path: Path, model_name: str, prompt_text: str =
             
         response = model.generate_content(
             [prompt, audio_file],
-            request_options={"timeout": 7200}
+            request_options={"timeout": 7200},
+            safety_settings=SAFETY_SETTINGS
         )
         return response.text
     except Exception as e:
@@ -220,15 +229,19 @@ def process_file(client, input_file: Path, output_dir: Path, model: str, move_to
         if not folder_name:
              folder_name = "OTROS"
              
-        # 2. Nombre limpio de archivo (Pre-Date + Date)
-        # Reconstruimos: "R2601 20260109"
-        clean_stem = f"{pre_date} {date_part}".strip()
+        # 2. Nombre limpio de archivo (Pre-Date + Date + Suffix)
+        # Reconstruimos: "R2601 20260109 01" para preservar sufijos únicos
+        clean_stem = f"{pre_date} {date_part} {post_date}".strip()
         
         # 3. Prompt de idiomas
+        # 3. Prompt de idiomas
+        # Configurar siempre Español como base, usando post_date como contexto extra
         if post_date:
-            languages_prompt = f"La transcripción debe ser precisa en estos idiomas: {post_date}."
-            logger.info(f"Detectados idiomas/info extra: '{post_date}'. Usando como prompt.")
-            tqdm.write(f"  -> Idiomas detectados: {post_date}")
+            languages_prompt = f"El idioma principal es español. Contexto adicional o idiomas secundarios: {post_date}."
+            logger.info(f"Detectados idiomas/info extra: '{post_date}'. Usando como prompt contextual.")
+            tqdm.write(f"  -> Contexto extra detectado: {post_date}")
+        else:
+            languages_prompt = "El idioma del audio es español."
             
     else:
         # Fallback si no hay fecha estándar
