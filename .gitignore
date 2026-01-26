@@ -5,6 +5,8 @@
 !2_Areas/
 !2_Areas/Python/
 !2_Areas/Python/transcribir_audio.py
+!99_*.md
+!99_*.sh
 !requirements.txt
 !.env.example
 !README.md
