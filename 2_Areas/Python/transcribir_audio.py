@@ -5,12 +5,9 @@ import logging
 import subprocess
 import shutil
 import re
-import time
 from typing import List
 from pathlib import Path
 from dotenv import load_dotenv
-from openai import OpenAI
-from tenacity import retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
 import google.generativeai as genai
 
@@ -41,13 +38,6 @@ SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
 ]
-
-def get_openai_client():
-    api_key = os.environ.get('OPENAI_API_KEY')
-    if not api_key:
-        print("Error: No se encontró OPENAI_API_KEY en las variables de entorno.")
-        sys.exit(1)
-    return OpenAI(api_key=api_key)
 
 def check_ffmpeg():
     if not shutil.which("ffmpeg"):
@@ -148,51 +138,66 @@ def split_audio_smart(audio_path: Path, segment_time: int = CHUNK_TIME_SECONDS) 
         logger.error(f"Error crítico en split_audio_smart: {e}")
         raise
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def transcribe_chunk(client, chunk_path: Path, model: str, prompt_text: str = None) -> str:
-    """
-    Transcribe un chunk individual usando la API de OpenAI.
-    """
-    logger.info(f"Transcribiendo chunk: {chunk_path.name} con modelo {model}")
-    try:
-        # Verificar tamaño antes de enviar (<25MB)
-        size_mb = chunk_path.stat().st_size / (1024 * 1024)
-        if size_mb > 24:
-            logger.warning(f"Chunk {chunk_path.name} es muy grande ({size_mb:.2f}MB). Podría fallar.")
-            
-        with open(chunk_path, "rb") as audio_file:
-            # Prepare arguments
-            kwargs = {
-                "model": model,
-                "file": audio_file
-            }
-            if prompt_text:
-                kwargs["prompt"] = prompt_text
-                
-            response = client.audio.transcriptions.create(**kwargs)
-            return response.text
-    except Exception as e:
-        logger.error(f"Error al transcribir chunk {chunk_path.name}: {e}")
-        raise
 
-def transcribe_with_gemini(audio_path: Path, model_name: str, prompt_text: str = None) -> str:
+# Prompt clínico para sesiones de psicoterapia
+CLINICAL_PROMPT = (
+    "Genera una transcripción literal y exacta del audio de una sesión de psicoterapia entre un terapeuta y un paciente.\n\n"
+    "FORMATO OBLIGATORIO:\n"
+    "- Cada turno de palabra DEBE empezar con la etiqueta del hablante: \"Terapeuta:\" o \"Paciente:\"\n"
+    "- Usa \"Acompañante:\" si hay un tercer participante\n"
+    "- TODOS los turnos deben estar etiquetados, de principio a fin del audio, sin excepción\n"
+    "- Un salto de línea entre cada cambio de hablante\n"
+    "- Si no puedes distinguir quién habla en un fragmento, usa \"Hablante:\" pero NUNCA omitas la etiqueta\n\n"
+    "CONTENIDO:\n"
+    "- Devuelve SOLAMENTE el texto de la transcripción\n"
+    "- NO incluyas introducciones, comentarios ni encabezados\n"
+    "- Empieza directamente con el primer turno de palabra"
+)
+
+# Prompt genérico para transcripciones no clínicas
+GENERIC_PROMPT = (
+    "Transcribe este audio íntegramente de forma literal y exacta.\n\n"
+    "FORMATO:\n"
+    "- Si hay varios hablantes, identifica cada turno con \"Hablante 1:\", \"Hablante 2:\", etc.\n"
+    "- Un salto de línea entre cada cambio de hablante\n"
+    "- TODOS los turnos deben estar etiquetados de principio a fin, sin excepción\n"
+    "- Si solo hay un hablante, transcribe como texto continuo con párrafos\n\n"
+    "CONTENIDO:\n"
+    "- Usa puntuación correcta\n"
+    "- NO omitas ningún fragmento del audio, aunque sea repetitivo\n"
+    "- Devuelve SOLAMENTE el texto de la transcripción\n"
+    "- NO incluyas introducciones, comentarios ni encabezados\n"
+    "- Empieza directamente con el contenido del audio"
+)
+
+# Regex para detectar nombres de archivo clínicos: Letra + 4 dígitos + espacio + fecha YYYYMMDD
+CLINICAL_FILENAME_PATTERN = re.compile(r'^[A-Za-z]\d{4}\s+\d{8}')
+
+def transcribe_with_gemini(audio_path: Path, model_name: str, prompt_text: str = None, is_clinical: bool = False) -> str:
     """
     Transcribe un archivo completo usando Google Gemini.
+    Usa prompt clínico si is_clinical=True, genérico en caso contrario.
     """
-    logger.info(f"Transcribiendo con Gemini ({model_name}): {audio_path.name}")
+    mode_label = "CLÍNICO" if is_clinical else "GENÉRICO"
+    logger.info(f"Transcribiendo con Gemini ({model_name}) [{mode_label}]: {audio_path.name}")
     try:
         # Subir archivo
         audio_file = genai.upload_file(path=str(audio_path))
         
-        # Configurar modelo
+        # Configurar modelo con max_output_tokens alto para audios largos
+        generation_config = genai.types.GenerationConfig(
+            max_output_tokens=65536
+        )
         model = genai.GenerativeModel(model_name)
         
-        prompt = "Transcribe este audio íntegramente. Mantén los turnos de palabra si es posible y usa puntuación correcta."
+        # Seleccionar prompt según tipo
+        prompt = CLINICAL_PROMPT if is_clinical else GENERIC_PROMPT
         if prompt_text:
-            prompt = f"{prompt} Contexto adicional: {prompt_text}"
+            prompt = f"{prompt}\n\n{prompt_text}"
             
         response = model.generate_content(
             [prompt, audio_file],
+            generation_config=generation_config,
             request_options={"timeout": 7200},
             safety_settings=SAFETY_SETTINGS
         )
@@ -201,7 +206,7 @@ def transcribe_with_gemini(audio_path: Path, model_name: str, prompt_text: str =
         logger.error(f"Error en Gemini ({audio_path.name}): {e}")
         raise
 
-def process_file(client, input_file: Path, output_dir: Path, model: str, move_to: Path = None, delete_original: bool = False) -> dict:
+def process_file(input_file: Path, output_dir: Path, model: str, move_to: Path = None, delete_original: bool = False) -> dict:
     """
     Proceso principal para un archivo.
     Devuelve un diccionario con las rutas del archivo de audio optimizado y la transcripción.
@@ -211,6 +216,15 @@ def process_file(client, input_file: Path, output_dir: Path, model: str, move_to
     # Ej: "R2601 20260109 español valenciano.mp3"
     
     filename_stem = input_file.stem # "R2601 20260109 español valenciano"
+    
+    # Detectar si es un archivo clínico (formato: Letra+4dígitos YYYYMMDD)
+    is_clinical = bool(CLINICAL_FILENAME_PATTERN.match(filename_stem))
+    if is_clinical:
+        logger.info(f"Archivo clínico detectado: {filename_stem}")
+        tqdm.write(f"  -> Modo: CLÍNICO (patrón detectado en nombre)")
+    else:
+        logger.info(f"Archivo no clínico: {filename_stem}")
+        tqdm.write(f"  -> Modo: GENÉRICO")
     
     # Regex para capturar: (Grupo 1: Todo antes de la fecha) (Grupo 2: La fecha 8 digitos) (Grupo 3: Todo después)
     match = re.search(r"^(.*?)\s*(\d{8})(.*)$", filename_stem)
@@ -302,20 +316,15 @@ def process_file(client, input_file: Path, output_dir: Path, model: str, move_to
         logger.info(f"Duración detectada: {duration:.2f}s")
         
         chunks = []
-        is_gemini = model.startswith("gemini")
         
-        if is_gemini:
-            # Si Gemini y > 1h, troceamos en bloques de 40 min para asegurar estabilidad
-            if duration > 3600:
-                tqdm.write(f"  -> Audio largo detectado ({duration/3600:.1f}h). Dividiendo para Gemini...")
-                sys.stdout.flush()
-                chunks = split_audio_smart(final_audio_path, segment_time=2400) # 40 min
-            else:
-                # Audio corto, Gemini lo procesa de una pieza
-                chunks = [final_audio_path]
+        # Si > 1h, troceamos en bloques de 40 min para asegurar estabilidad
+        if duration > 3600:
+            tqdm.write(f"  -> Audio largo detectado ({duration/3600:.1f}h). Dividiendo...")
+            sys.stdout.flush()
+            chunks = split_audio_smart(final_audio_path, segment_time=2400) # 40 min
         else:
-            # OpenAI siempre usa chunks de 10 min
-            chunks = split_audio_smart(final_audio_path, segment_time=CHUNK_TIME_SECONDS)
+            # Audio corto, se procesa de una pieza
+            chunks = [final_audio_path]
             
         if chunks:
             new_chunks = [c for c in chunks if c != final_audio_path]
@@ -325,26 +334,18 @@ def process_file(client, input_file: Path, output_dir: Path, model: str, move_to
         full_transcript = []
         
         for i, chunk in enumerate(chunks):
-            if is_gemini:
-                if len(chunks) > 1:
-                    tqdm.write(f"  -> Transcribiendo bloque {i+1}/{len(chunks)} con {model}...")
-                    sys.stdout.flush()
-                else:
-                    tqdm.write(f"  -> Transcribiendo con {model}...")
-                    sys.stdout.flush()
-                    
-                text = transcribe_with_gemini(chunk, model, prompt_text=languages_prompt)
-                full_transcript.append(text)
-            else:
-                # OpenAI
-                tqdm.write(f"  -> Transcribiendo {chunk.name}...")
+            if len(chunks) > 1:
+                tqdm.write(f"  -> Transcribiendo bloque {i+1}/{len(chunks)} con {model}...")
                 sys.stdout.flush()
-                text = transcribe_chunk(client, chunk, model, prompt_text=languages_prompt)
-                full_transcript.append(text)
+            else:
+                tqdm.write(f"  -> Transcribiendo con {model}...")
+                sys.stdout.flush()
+                
+            text = transcribe_with_gemini(chunk, model, prompt_text=languages_prompt, is_clinical=is_clinical)
+            full_transcript.append(text)
         
         # 4. Guardar (Usando NOMBRE LIMPIO)
-        # Separador para Gemini si hay varios trozos
-        separator = "\n\n[Continuación...]\n\n" if (is_gemini and len(chunks) > 1) else "\n"
+        separator = "\n\n[Continuación...]\n\n" if len(chunks) > 1 else "\n"
         final_text = separator.join(full_transcript)
         output_file = output_dir / f"{clean_stem}.txt"
         
@@ -398,13 +399,13 @@ def process_file(client, input_file: Path, output_dir: Path, model: str, move_to
                     tqdm.write(f"Error moviendo original: {move_e}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Batch Audio Transcription with OpenAI Models")
+    parser = argparse.ArgumentParser(description="Batch Audio Transcription with Gemini")
     parser.add_argument("--input", default="input", help="Input directory containing audio files (default: input)")
     parser.add_argument("--output", default="output", help="Output directory for text files (default: output)")
     parser.add_argument("--file", help="Path to a single audio file to process (overrides --input directory mode)")
-    parser.add_argument("--model", default="gpt-4o-mini-transcribe", 
-                        choices=["whisper-1", "gpt-4o-mini-transcribe", "gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-flash"], 
-                        help="Model to use (default: gpt-4o-mini-transcribe)")
+    parser.add_argument("--model", default="gemini-2.5-flash", 
+                        choices=["gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-flash"], 
+                        help="Gemini model to use (default: gemini-2.5-flash)")
     parser.add_argument("--move-processed-to", help="Directory to move original files after successful processing")
     parser.add_argument("--delete-original", action="store_true", help="Delete original file after successful processing")
     
@@ -418,17 +419,12 @@ def main():
     
     processed_dir = Path(args.move_processed_to) if args.move_processed_to else None
     
-    # Inicializar cliente según el modelo
-    openai_client = None
-    
-    if args.model.startswith("gemini"):
-        google_key = os.environ.get('GOOGLE_API_KEY')
-        if not google_key:
-            print("Error: No se encontró GOOGLE_API_KEY en las variables de entorno.")
-            sys.exit(1)
-        genai.configure(api_key=google_key)
-    else:
-        openai_client = get_openai_client()
+    # Inicializar Gemini
+    google_key = os.environ.get('GOOGLE_API_KEY')
+    if not google_key:
+        print("Error: No se encontró GOOGLE_API_KEY en las variables de entorno.")
+        sys.exit(1)
+    genai.configure(api_key=google_key)
 
     # MODO 1: Archivo único
     if args.file:
@@ -438,7 +434,7 @@ def main():
             sys.exit(1)
         
         print(f"Procesando archivo único: {file_path.name} usando modelo {args.model}")
-        process_file(openai_client, file_path, output_dir, args.model, move_to=processed_dir, delete_original=args.delete_original)
+        process_file(file_path, output_dir, args.model, move_to=processed_dir, delete_original=args.delete_original)
         print("\nProcesamiento finalizado.")
         return
 
@@ -461,7 +457,7 @@ def main():
     
     # Barra de progreso total
     for audio_file in tqdm(files_to_process, desc="Progreso Total", unit="archivos"):
-        process_file(openai_client, audio_file, output_dir, args.model, move_to=processed_dir, delete_original=args.delete_original)
+        process_file(audio_file, output_dir, args.model, move_to=processed_dir, delete_original=args.delete_original)
     
     print("\nProcesamiento finalizado.")
 
